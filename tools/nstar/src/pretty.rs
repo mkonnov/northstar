@@ -199,7 +199,7 @@ fn format_err(err: &model::Error) -> String {
                 }
             )
         }
-        model::Error::Unexpected { module, error } => format!("{}: {}", module, error),
+        model::Error::Unexpected { error } => error.to_string(),
     }
 }
 

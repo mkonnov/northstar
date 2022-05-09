@@ -24,6 +24,7 @@ use crate::{
         CGroupEvent, ENV_CONSOLE, ENV_CONTAINER, ENV_NAME, ENV_VERSION,
     },
 };
+use anyhow::Result;
 use bytes::Bytes;
 use futures::{
     future::{join_all, ready, Either},
@@ -122,7 +123,7 @@ impl State {
         events_tx: EventTx,
         notification_tx: NotificationTx,
         forker: Forker,
-    ) -> Result<State, Error> {
+    ) -> Result<State> {
         let repositories = HashMap::new();
         let containers = HashMap::new();
         let mount_control = Arc::new(
@@ -157,7 +158,7 @@ impl State {
     }
 
     /// Iterate the list of repositories and initialize them
-    async fn initialize_repositories(&mut self) -> Result<HashSet<RepositoryId>, Error> {
+    async fn initialize_repositories(&mut self) -> Result<HashSet<RepositoryId>> {
         // List of repositories to mount
         let mut mount_repositories = HashSet::with_capacity(self.config.repositories.len());
 
@@ -202,7 +203,7 @@ impl State {
     }
 
     /// Try to mount all installed continers
-    async fn automount(&mut self, repositories: &HashSet<RepositoryId>) -> Result<(), Error> {
+    async fn automount(&mut self, repositories: &HashSet<RepositoryId>) -> Result<()> {
         if repositories.is_empty() {
             return Ok(());
         }
@@ -305,7 +306,7 @@ impl State {
     }
 
     /// Create a future that mounts `container`
-    fn mount(&self, container: &Container) -> impl Future<Output = Result<PathBuf, Error>> {
+    fn mount(&self, container: &Container) -> impl Future<Output = Result<PathBuf>> {
         // Find the repository that has the container
         let container_state = self.containers.get(container).expect("internal error");
         let repository = self
@@ -318,7 +319,6 @@ impl State {
         let mount_control = self.mount_control.clone();
         mount_control
             .mount(npk, &root, key.as_ref())
-            .map_err(Error::Mount)
             .map(|_| Ok(root))
     }
 
@@ -346,7 +346,7 @@ impl State {
                 .as_ref()
                 .ok_or_else(|| Error::UmountBusy(container.clone()))
         }) {
-            Ok(root) => Either::Left(MountControl::umount(root).map_err(Error::Mount)),
+            Ok(root) => Either::Left(MountControl::umount(root).map_err(Error::from)),
             Err(e) => Either::Right(ready(Err(e))),
         }
     }
@@ -911,7 +911,6 @@ impl State {
                         Err(e) => {
                             error!("failed to kill {} with {}: {}", container, signal, e);
                             model::Response::Error(model::Error::Unexpected {
-                                module: "invalid signal".into(),
                                 error: e.to_string(),
                             })
                         }
@@ -970,13 +969,15 @@ impl State {
                 // Containers cannot be mounted twice. If the container
                 // is already mounted return an error for this entity.
                 Ok(state) if state.is_mounted() => {
-                    let error = Err(Error::MountBusy(container.clone()));
-                    mounts.push(Either::Right(ready(error)));
+                    mounts.push(Either::Left(ready(Err(Error::InvalidContainer(
+                        container.clone(),
+                    )))));
                 }
-                Ok(_) => mounts.push(Either::Left(self.mount(container))),
+                Ok(_) => mounts.push(Either::Right(self.mount(container).map_err(|e| e.into()))),
                 Err(_) => {
-                    let error = Err(Error::InvalidContainer(container.clone()));
-                    mounts.push(Either::Right(ready(error)));
+                    mounts.push(Either::Left(ready(Err(Error::InvalidContainer(
+                        container.clone(),
+                    )))));
                 }
             }
         }
@@ -1179,15 +1180,14 @@ impl State {
 
     fn npk(&self, container: &Container) -> Result<&Npk, Error> {
         let state = self.state(container)?;
-        let repository = self.repository(&state.repository)?;
-        repository
+        Ok(self
+            .repository(&state.repository)?
             .get(container)
-            .ok_or_else(|| Error::InvalidContainer(container.clone()))
+            .expect("container has invalid repository reference"))
     }
 
     fn manifest(&self, container: &Container) -> Result<&Manifest, Error> {
-        let npk = self.npk(container)?;
-        Ok(npk.manifest())
+        self.npk(container).map(|npk| npk.manifest())
     }
 
     fn repository(&self, repository: &str) -> Result<&Repository, Error> {

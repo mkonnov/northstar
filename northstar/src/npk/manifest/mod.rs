@@ -2,6 +2,7 @@ use crate::{
     common::{container::Container, name::Name, non_nul_string::NonNulString, version::Version},
     seccomp::{Seccomp, Selinux, SyscallRule},
 };
+use anyhow::{bail, Context};
 use itertools::Itertools;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -89,24 +90,23 @@ impl Manifest {
 
     /// Read a manifest from `reader`
     pub fn from_reader<R: io::Read>(reader: R) -> Result<Self, Error> {
-        let manifest: Self = serde_yaml::from_reader(reader).map_err(Error::SerdeYaml)?;
-        manifest.verify()?;
+        let manifest: Self = serde_yaml::from_reader(reader).context("failed to read yaml")?;
+        manifest.verify().context("failed to verify manifest")?;
         Ok(manifest)
     }
 
     /// Write the manifest to `writer`
     pub fn to_writer<W: io::Write>(&self, writer: W) -> Result<(), Error> {
-        serde_yaml::to_writer(writer, self).map_err(Error::SerdeYaml)
+        serde_yaml::to_writer(writer, self).context("failed to write yaml")?;
+        Ok(())
     }
 
-    fn verify(&self) -> Result<(), Error> {
+    fn verify(&self) -> anyhow::Result<()> {
         // Most optionals in the manifest are not valid for a resource container
 
         if let Some(init) = &self.init {
             if NonNulString::try_from(init.display().to_string()).is_err() {
-                return Err(Error::Invalid(
-                    "init path must be a string without zero bytes".to_string(),
-                ));
+                bail!("init path must be a string without zero bytes");
             }
         } else if !self.args.is_empty()
             || !self.env.is_empty()
@@ -116,19 +116,18 @@ impl Manifest {
             || !self.capabilities.is_empty()
             || !self.suppl_groups.is_empty()
         {
-            return Err(Error::Invalid(
+            bail!(
                 "resource containers must not define any of the following manifest entries:\
                     args, env, autostart, cgroups, seccomp, capabilities, suppl_groups, io"
-                    .to_string(),
-            ));
+            );
         }
 
         // Check for invalid uid or gid of 0
         if self.uid == 0 {
-            return Err(Error::Invalid("invalid uid of 0".to_string()));
+            bail!("invalid uid of 0");
         }
         if self.gid == 0 {
-            return Err(Error::Invalid("invalid gid of 0".to_string()));
+            bail!("invalid gid of 0");
         }
 
         // Check for reserved env variable names
@@ -137,9 +136,7 @@ impl Manifest {
                 .contains_key(unsafe { &NonNulString::from_str_unchecked(key) })
             // safe - constants
         }) {
-            return Err(Error::Invalid(
-                "invalid environment: reserved variable name".into(),
-            ));
+            bail!("invalid environment: reserved variable name");
         }
 
         // Check for relative and overlapping bind mounts
@@ -151,9 +148,7 @@ impl Manifest {
             .sorted()
             .try_for_each(|p| {
                 if p.is_relative() {
-                    return Err(Error::Invalid(
-                        "mount points must not be relative".to_string(),
-                    ));
+                    bail!("mount points must not be relative");
                 }
                 // Check for overlapping bind mount paths by checking if one path is the prefix of the next one
                 let curr_comps: Vec<Component> = p.components().into_iter().collect();
@@ -162,7 +157,7 @@ impl Manifest {
 
                 if !prev_too_short && !prev_too_long && prev_comps == curr_comps[..prev_comps.len()]
                 {
-                    return Err(Error::Invalid("mount points must not overlap".to_string()));
+                    bail!("mount points must not overlap");
                 }
                 prev_comps = curr_comps;
                 Ok(())
@@ -176,9 +171,7 @@ impl Manifest {
                 // The options field, which must be checked, is available for Mount::Bind and Mount::Resource
                 mount::Mount::Resource(m) => {
                     if m.options.contains(&mount::MountOption::Rec) {
-                        Err(Error::Invalid(
-                            "non bind mounts must not be recursive".to_string(),
-                        ))
+                        bail!("non bind mounts must not be recursive")
                     } else {
                         Ok(())
                     }
@@ -193,20 +186,17 @@ impl Manifest {
             const XATTR_SIZE_MAX: usize = 65536;
 
             if selinux.context.len() >= XATTR_SIZE_MAX {
-                return Err(Error::Invalid(format!(
+                bail!(
                     "Selinux context is too long. Maximum length is {}",
                     XATTR_SIZE_MAX
-                )));
+                );
             }
             if !selinux
                 .context
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '_')
             {
-                return Err(Error::Invalid(
-                    "Selinux context must consist of alphanumeric ASCII characters, '?' or '_'"
-                        .to_string(),
-                ));
+                bail!("Selinux context must consist of alphanumeric ASCII characters, '?' or '_'");
             }
         }
 
@@ -219,20 +209,19 @@ impl Manifest {
                     match filter.1 {
                         SyscallRule::Args(args) => {
                             if args.index > MAX_ARG_INDEX {
-                                return Err(Error::Invalid(format!(
+                                bail!(
                                     "Seccomp syscall argument index must be {} or less",
                                     MAX_ARG_INDEX
-                                )));
+                                );
                             }
                             if args.values.is_none() && args.mask.is_none() {
-                                return Err(Error::Invalid(
-                                    "Either 'values' or 'mask' must be defined in seccomp syscall argument filter".to_string()));
+                                bail!("Either 'values' or 'mask' must be defined in seccomp syscall argument filter");
                             }
                             if let Some(values) = &args.values {
                                 if values.len() > MAX_ARG_VALUES {
-                                    return Err(Error::Invalid(format!(
+                                    bail!(
                                         "Seccomp syscall argument cannot have more than {} allowed values",
-                                        MAX_ARG_VALUES)));
+                                        MAX_ARG_VALUES);
                                 }
                             }
                         }
@@ -251,9 +240,9 @@ impl Manifest {
 impl FromStr for Manifest {
     type Err = Error;
 
-    fn from_str(s: &str) -> Result<Manifest, Error> {
-        let manifest: Self = serde_yaml::from_str(s).map_err(Error::SerdeYaml)?;
-        manifest.verify()?;
+    fn from_str(s: &str) -> Result<Manifest, Self::Err> {
+        let manifest: Self = serde_yaml::from_str(s).context("failed to read yaml string")?;
+        manifest.verify().context("failed to verify manifest")?;
         Ok(manifest)
     }
 }
@@ -270,13 +259,8 @@ impl ToString for Manifest {
 
 /// Manifest parsing error
 #[derive(Error, Debug)]
-#[allow(missing_docs)]
-pub enum Error {
-    #[error("invalid manifest: {0}")]
-    Invalid(String),
-    #[error("failed to parse: {0}")]
-    SerdeYaml(#[from] serde_yaml::Error),
-}
+#[error(transparent)]
+pub struct Error(#[from] anyhow::Error);
 
 /// Autostart options
 #[derive(Clone, Eq, PartialEq, Debug, Hash, Serialize, Deserialize, JsonSchema)]
